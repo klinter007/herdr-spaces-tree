@@ -1,21 +1,27 @@
 // Workspace spaces: stable colored avatars, worktrees under their checkout,
 // grouped by machine when more than one is known. After a space's name, the repo
-// its first terminal is in now, only where unusual: branch, ahead/behind. Agent state lives in the agents list, not here. Click to
+// its first terminal is in now, only where unusual: branch, ahead/behind. Click to
 // switch, right-click for its menu, drag to reorder.
 //
 // spaces-tree, a fork of Herdr's spaces: spaces also sit in groups the person names (Work,
-// Personal, ...). A group is a header row with its spaces under it; a click folds it, and a
-// folded group still says when a space in it works or needs you. Drag a space onto a header,
-// or use the dots at the right of a hovered row, to move it. A right click on a header renames
-// or deletes the group. Spaces in no group come first. The groups live in shared GROUPS.
+// Personal, ...), and groups sit in groups, at any depth. A group is a folder row with what it
+// holds under it: its spaces, its dormant entries, then its groups. A click folds it, and a
+// folded group still says when a space in it works or needs you. Drag a space or a group onto
+// a folder to put it there (onto the "Spaces" title: out of every group), or use the dots at
+// the right of a hovered row. A right click on a folder renames, lifts or deletes the group.
+// A dormant entry is a project with no open space: a click opens a space there, and when that
+// space closes the entry sleeps again in the same place.
 // The agents are in the same tree, in place of the separate Agents list: a space with agents has
 // a chevron that opens them, one row each, with its state as an icon: active (a green ring that
 // turns), needs you (red "!"), finished and not looked at yet (an orange dot), idle (a grey
 // ring). A closed space, and a folded group, show the loudest state of what is inside.
+// Agents change the tree from a shell with bin/spaces-tree (see api() below and the README).
 
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
-import { spaces, machines, panes, agents, run, openOverlay, closeOverlay, props, exec, hc, theme, shared, setShared, watchFolder, window, layout } from "herdr";
+import { spaces, machines, panes, agents, run, openOverlay, closeOverlay, props, exec, hc, theme, shared, setShared, watchFolder, window, layout, appHome, checking, nextCommand, writeTextFile } from "herdr";
+import * as fs from "fs/promises";
+import * as T from "./tree.js";
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -37,6 +43,9 @@ function place(s, ps) {
 }
 const rowHeight = ({ tree }) => (tree ? 28 : 30);
 const RAIL_CELL = 32;
+const TOP = "<top>"; // a drop on the title: out of every group
+const STEP = 18; // one level of the tree, in px
+const WAKE = "spaces-tree.wake"; // a popup asks the sidebar to open a dormant entry: { id, at }
 const railCell = (el) => h_flex().flex_none().justify_center().child(el);
 const where = (s, ps) => JSON.stringify([s.machine ?? null, place(s, ps)]);
 const base = (path) => path.replace(/\/+$/, "").split("/").pop();
@@ -69,12 +78,15 @@ function stateIcon(t, status, size = 12) {
 }
 const loudest = (list) => LOUD.find((s) => list.some((a) => a.status === s)) ?? null;
 
-// The groups: { order: [name], of: { spaceId: name }, folded: [name], open: [spaceId] }.
-const GROUPS = "spaces-tree.groups";
-const EMPTY = { order: [], of: {}, folded: [], open: [] };
+// The tree (groups at any depth, the spaces in them, dormant entries) is in tree.js.
 // props { demo: true }: made-up spaces and agents, for a picture of the mod.
 const DEMO = {
-  groups: { order: ["Work", "Side projects", "Home"], of: { s1: "Work", s2: "Work", s3: "Work", s4: "Side projects", s5: "Side projects", s6: "Home" }, folded: ["Home"], open: ["s1"] },
+  tree: T.normalize({
+    v: 2,
+    groups: [{ id: "g1", name: "Work", parent: null }, { id: "g2", name: "Design", parent: "g1", color: "ansi5" }, { id: "g3", name: "Side projects", parent: null, color: "ansi2" }, { id: "g4", name: "Home", parent: null }],
+    of: { s1: "g1", s2: "g1", s3: "g2", s4: "g3", s5: "g3", s6: "g4" }, folded: ["g4"], open: ["s1"],
+    dormant: [{ id: "d1", name: "billing-service", folder: "~/code/billing", group: "g1" }, { id: "d2", name: "old-blog", folder: "~/code/blog", group: "g3" }],
+  }),
   colors: { s0: "ansi5", s1: "ansi4", s2: "ansi3", s3: "ansi6", s4: "ansi2", s5: "ansi1", s6: "ansi4" },
   spaces: [["s0", "scratch"], ["s1", "shop-api", true], ["s2", "mobile-app"], ["s3", "design-system"], ["s4", "recipe-bot"], ["s5", "chess-engine"], ["s6", "home-server"]],
   agents: [
@@ -90,20 +102,30 @@ const DEMO = {
   ],
 };
 const demo = () => Boolean(props()?.demo);
-const groups = () => (demo() ? DEMO.groups : shared(GROUPS) ?? EMPTY);
-const saveGroups = (g) => { if (!demo()) setShared(GROUPS, { order: [...g.order], of: { ...g.of }, folded: [...(g.folded ?? [])], open: [...(g.open ?? [])] }); };
+// A fresh copy each time: change it, then save it.
+const tree = () => (demo() ? T.clone(DEMO.tree) : T.load(shared(T.TREE), shared(T.V1)));
+// The demo never writes shared state.
+const saveTree = (t) => { if (!demo()) setShared(T.TREE, T.normalize(t)); };
+// One change to the tree: `fn(t)` edits it; saved unless it throws.
+const change = (fn) => { const t = tree(), r = fn(t); saveTree(t); return r; };
 const allAgents = () => (demo() ? DEMO.agents : agents());
 
 export default class Spaces extends View {
   init(_props, cx) {
-    // The popups this mod opens over itself: a space's group, a group's name.
-    if (props()?.pick || props()?.group) {
+    // The popups this mod opens over itself: a space's group (pick), a group (group), a dormant entry (dormant).
+    if (props()?.pick || props()?.group || props()?.dormant) {
       this.popup = true;
-      this.input = InputState.new({ placeholder: props()?.group ? "New name" : "New group…", value: props()?.group ?? "" });
+      if (props()?.dormant) return;
+      const g = props()?.group ? T.byId(tree(), props().group) : null;
+      this.input = InputState.new({ placeholder: g ? "New name" : "New group…", value: g?.name ?? "" });
       this.input.on("submit", (_e, cx) => this.entered(cx));
       cx.timer.after(0, () => this.input.focus());
       return;
     }
+    this.waking = new Set(); // dormant entries whose space is being opened
+    this.pressedGroup = null; // a folder being dragged
+    this.wokeAt = shared(WAKE)?.at ?? null;
+    if (!demo() && !checking()) this.serve(cx);
     this.hot = null; // the row under the pointer
     this.git = {}; // where() -> { name, branch, ahead, behind, repo, linked }, null: not a repo
     this.checked = {}; // where() -> when it was last looked at
@@ -132,10 +154,189 @@ export default class Spaces extends View {
   checkNew(cx) {
     const now = Date.now();
     const sp = spaces();
+    if (!demo()) {
+      this.settleDormant(sp);
+      const asked = shared(WAKE);   // "Open a space here" in a dormant entry's popup
+      if (asked?.at && asked.at !== this.wokeAt) { this.wokeAt = asked.at; if (now - asked.at < 5000) this.wakeSoon(asked.id, cx); }
+    }
     for (const s of sp) if (!this.shown.has(s.id)) this.born[s.id] ??= now;
     const due = this.due(now, sp, panes());
     if (due.size) this.refreshGit(due, cx);
     if (sp.some((s) => !this.shown.has(s.id)) || this.orderingDue(now)) cx.notify();
+  }
+
+  // A dormant entry whose space closed sleeps again. Only once that space's machine is readable,
+  // so a slow start or a machine away doesn't look like a close.
+  settleDormant(sp) {
+    if (!shared(T.TREE)) return;   // v1 has no dormant entries
+    const t = tree();
+    if (!t.dormant.some((d) => d.space)) return;
+    const ids = new Set(sp.map((s) => s.id));
+    const live = (d) => {
+      if (this.waking.has(d.id)) return null;
+      const m = machines().find((k) => (k.name ?? null) === (d.machine ?? null));
+      return m?.layout === "ready" ? ids.has(d.space) : null;
+    };
+    if (T.settle(t, live)) saveTree(t);
+  }
+
+  // The agent API. bin/spaces-tree writes a request, <id>.json = { op, args }, into
+  // <app home>/data/spaces-tree/inbox and asks for `spaces-tree.inbox`; this copy answers with
+  // outbox/<id>.json = { ok, ... } | { ok: false, error }. Files, so a request needs no click,
+  // gets an answer, and waits in the inbox while the app is closed; the tree itself is shared
+  // state, kept by Herdr across restarts.
+  serve(cx) {
+    const root = `${appHome()}/data/spaces-tree`;
+    this.inbox = `${root}/inbox`;
+    this.outbox = `${root}/outbox`;
+    cx.spawn(async (cx) => {
+      try {
+        await fs.mkdir(this.inbox, { recursive: true });
+        await fs.mkdir(this.outbox, { recursive: true });
+        await this.sweep();
+      } catch (e) { console.log(`spaces-tree: no inbox: ${e?.message ?? e}`); return; }
+      for (;;) {
+        await this.drain(cx);
+        try { await watchFolder(this.inbox); } catch { await cx.sleep(1000); }
+      }
+    });
+    // `herdr-app do spaces-tree.inbox`: look now, without waiting for the folder watch.
+    cx.spawn(async (cx) => { for (;;) { if (String(await nextCommand()).startsWith("inbox")) await this.drain(cx); } });
+  }
+
+  // Answers and claims left over from an earlier run (an id starts with its time in ms).
+  async sweep() {
+    const old = Date.now() - 10 * 60 * 1000;
+    for (const name of await fs.readdir(this.outbox)) {
+      const at = Number(name.split("-")[0]);
+      if (Number.isFinite(at) && at < old) try { await fs.unlink(`${this.outbox}/${name}`); } catch {}
+    }
+  }
+
+  async drain(cx) {
+    if (this.draining) { this.drainAgain = true; return; }
+    this.draining = true;
+    try {
+      do {
+        this.drainAgain = false;
+        let names = [];
+        try { names = (await fs.readdir(this.inbox)).filter((n) => /^[\w-]+\.json$/.test(n)).sort(); } catch {}
+        for (const name of names) await this.handle(name, cx);
+      } while (this.drainAgain);
+    } finally { this.draining = false; }
+  }
+
+  async handle(name, cx) {
+    const id = name.slice(0, -5), request = `${this.inbox}/${name}`, claim = `${this.outbox}/${id}.claim`;
+    try { await writeTextFile(claim, "", null); } catch { return; }   // another copy has it
+    let reply;
+    try {
+      const text = await fs.readFile(request, "utf8");
+      reply = { ok: true, ...(await this.api(JSON.parse(text), cx)) };
+    } catch (e) { reply = { ok: false, error: String(e?.message ?? e) }; }
+    try { await fs.unlink(request); } catch {}
+    try { await writeTextFile(`${this.outbox}/${id}.json`, `${JSON.stringify(reply, null, 2)}\n`, null); } catch (e) { console.log(`spaces-tree: no answer for ${id}: ${e?.message ?? e}`); }
+    try { await fs.unlink(claim); } catch {}
+    cx.notify();
+  }
+
+  // A space by id, or by a name only one space has.
+  findSpace(ref) {
+    if (typeof ref !== "string" || !ref) throw new Error("which space? (its id from `herdr-app ls` or its name)");
+    const sp = spaces(), exact = sp.find((s) => s.id === ref);
+    if (exact) return exact;
+    const hits = sp.filter((s) => s.name.toLowerCase() === ref.toLowerCase());
+    if (hits.length > 1) throw new Error(`more than one space is called "${ref}": use its id`);
+    if (!hits.length) throw new Error(`no open space "${ref}"`);
+    return hits[0];
+  }
+
+  async api(req, cx) {
+    const a = { ...(req?.args ?? {}) };
+    switch (req?.op) {
+      case "list": return this.listing();
+      case "group.add": return change((t) => T.addGroup(t, a));
+      case "group.rename": return change((t) => T.renameGroup(t, a));
+      case "group.rm": return change((t) => T.removeGroup(t, a));
+      case "group.move": return change((t) => T.moveGroup(t, a));
+      case "group.color": return change((t) => T.colorGroup(t, a));
+      case "group.fold": return change((t) => T.foldGroup(t, a));
+      case "space.put": {
+        const s = this.findSpace(a.space);
+        const r = change((t) => T.putSpace(t, { space: s.id, group: a.group ?? null }));
+        // its place in the group: first, or in front of another space of the same group
+        const G = tree(), mates = spaces().filter((x) => x.id !== s.id && (G.of[x.id] ?? null) === r.group && (x.machine ?? null) === (s.machine ?? null));
+        const before = a.before ? this.findSpace(a.before) : a.first ? mates[0] : null;
+        if (a.before && !mates.some((x) => x.id === before.id)) throw new Error(`"${before.name}" is not in that group`);
+        if (before) {
+          const ids = spaces().map((x) => x.id).filter((id) => id !== s.id);
+          run("space.move", { id: s.id, index: ids.indexOf(before.id) + 1 });
+        }
+        return r;
+      }
+      case "dormant.add": {
+        if (a.space) {   // an open space, backed: it sleeps here when it closes
+          const s = this.findSpace(a.space);
+          a.space = s.id;
+          a.name ??= s.name;
+          a.folder ??= s.folder || place(s, panes());
+          a.machine = s.machine ?? null;
+          if (a.group === undefined) a.group = tree().of[s.id] ?? null;
+        }
+        return change((t) => T.addDormant(t, a));
+      }
+      case "dormant.put": return change((t) => T.putDormant(t, a));
+      case "dormant.rm": return change((t) => T.removeDormant(t, a));
+      case "dormant.open": {
+        const d = T.resolveDormant(tree(), a.dormant);
+        return { id: d.id, space: await this.wake(d.id, Boolean(a.focus), cx) };
+      }
+      default: throw new Error(`unknown op "${req?.op}"`);
+    }
+  }
+
+  // The tree as data: groups with what they hold, then what is in no group.
+  listing() {
+    const t = tree(), sp = spaces(), live = new Set(sp.map((s) => s.id));
+    const backs = Object.fromEntries(t.dormant.filter((d) => d.space).map((d) => [d.space, d.id]));
+    const space = (s) => ({ id: s.id, name: s.name, folder: s.folder, machine: s.machine ?? null, status: s.status ?? null, ...(backs[s.id] ? { dormant: backs[s.id] } : {}) });
+    const sleeper = (d) => ({ id: d.id, name: d.name, folder: d.folder, argv: d.argv, machine: d.machine, open: Boolean(d.space && live.has(d.space)), space: d.space && live.has(d.space) ? d.space : null });
+    const inGroup = (s) => Boolean(t.of[s.id] && T.byId(t, t.of[s.id]));
+    const node = (g) => ({
+      id: g.id, name: g.name, path: T.pathOf(t, g.id), color: g.color, folded: t.folded.includes(g.id),
+      spaces: sp.filter((s) => t.of[s.id] === g.id).map(space),
+      dormant: t.dormant.filter((d) => d.group === g.id).map(sleeper),
+      groups: T.children(t, g.id).map(node),
+    });
+    return { v: 2, groups: T.roots(t).map(node), ungrouped: { spaces: sp.filter((s) => !inGroup(s)).map(space), dormant: t.dormant.filter((d) => !d.group).map(sleeper) } };
+  }
+
+  // Opens a dormant entry's space (or shows the one already open) and files it where the entry is.
+  async wake(id, focus, cx) {
+    const d = T.resolveDormant(tree(), id), sp = spaces();
+    if (d.space && sp.some((s) => s.id === d.space)) { if (focus) run("space.select", { id: d.space }); return d.space; }
+    if (this.waking.has(d.id)) throw new Error(`"${d.name}" is already opening`);
+    this.waking.add(d.id);
+    try {
+      const before = new Set(sp.map((s) => s.id));
+      const args = { name: d.name, folder: d.folder, machine: d.machine ?? "", focus };
+      if (d.argv) args.argv = d.argv;
+      run("space.new", args);
+      let made = null;
+      for (let i = 0; i < 100 && !made; i++) {
+        await cx.sleep(100);
+        const fresh = spaces().filter((s) => !before.has(s.id));
+        made = fresh.find((s) => s.name === d.name) ?? (fresh.length === 1 ? fresh[0] : null);
+      }
+      if (!made) throw new Error(`no space appeared for "${d.name}" within 10 s`);
+      change((t) => {
+        const e = t.dormant.find((x) => x.id === d.id);
+        if (!e) return;
+        e.space = made.id;
+        if (e.group) t.of[made.id] = e.group; else delete t.of[made.id];
+      });
+      return made.id;
+    } finally { this.waking.delete(d.id); }
   }
 
   // Places whose git could have changed: new ones (a new space, a cd), where a
@@ -313,7 +514,7 @@ export default class Spaces extends View {
   // Spaces in order, each worktree space moved under its main checkout's.
   ordered() {
     if (demo()) {   // the made-up spaces, in their groups, with nothing asked of Herdr
-      const G = DEMO.groups, rank = (id) => G.order.indexOf(G.of[id]);
+      const G = DEMO.tree, ranks = T.ranks(G), rank = (id) => ranks[G.of[id]] ?? -1;
       return DEMO.spaces.map(([id, name, active], i) => ({ w: { id, name, active: Boolean(active), machine: null, tabs: [] }, i, g: null, tree: null, group: G.of[id] ?? null }))
         .sort((a, b) => rank(a.w.id) - rank(b.w.id));
     }
@@ -333,10 +534,11 @@ export default class Spaces extends View {
       const kids = list.filter((k) => nested(k) && k.g.repo === r.g.repo);
       kids.forEach((k, n) => out.push({ ...k, tree: n === kids.length - 1 ? "└─" : "├─" }));
     }
-    // Groups: the spaces of no group first, then each group in order; a worktree goes with its checkout.
-    const G = groups(), rank = (name) => { const n = G.order.indexOf(name); return n < 0 ? -1 : n; };
+    // Groups: the spaces of no group first, then each group in the order the tree shows them
+    // (a group, then the groups under it); a worktree goes with its checkout.
+    const G = tree(), ranks = T.ranks(G), rank = (id) => ranks[id] ?? -1;
     let last = null;
-    for (const r of out) { r.group = r.tree ? last : (G.order.includes(G.of[r.w.id]) ? G.of[r.w.id] : null); last = r.group; }
+    for (const r of out) { r.group = r.tree ? last : (G.of[r.w.id] in ranks ? G.of[r.w.id] : null); last = r.group; }
     out.sort((a, b) => rank(a.group) - rank(b.group)); // stable: the order inside a group stays
     // Simulate the batch so later indexes include earlier moves. An attempted
     // write can lose a sync conflict: allow the echo to settle before retrying.
@@ -424,103 +626,183 @@ export default class Spaces extends View {
             .text_size(11).text_color(t.foreground).bg(t.raised).cursor_pointer().hover(s => s.bg(t.hover))
             .on_click((_e, cx) => { cx.stop_propagation(); cx.write_to_clipboard(login); this.copiedLogin = login; cx.notify(); })
             .child(this.copiedLogin === login ? "Copied" : "Copy")))] : [];
-      return [cell(head), ...guidance, ...(folded ? [] : mine.length ? this.sections(mine, draw, t, collapsed) : [loading(m) ? loadingRow(m) : cell(empty)])];
+      return [cell(head), ...guidance, ...(folded ? [] : mine.length ? this.sections(mine, draw, t, collapsed, m) : [loading(m) ? loadingRow(m) : cell(empty)])];
     });
   }
 
-  // Rows under their group's header. In the narrow rail there are no headers.
-  sections(rows, draw, t, collapsed) {
+  // Rows in the tree: the spaces and dormant entries of no group, then each group with what it
+  // holds (its spaces, its dormant entries, then its groups). In the narrow rail: spaces only.
+  // `m`: the machine these rows are on (null: this computer); dormant entries show with theirs.
+  sections(rows, draw, t, collapsed, m = null) {
     if (collapsed) return rows.map(draw);
-    const G = groups(), all = allAgents(), open = new Set(G.open ?? []);
+    const G = tree(), all = allAgents(), open = new Set(G.open), folded = new Set(G.folded);
+    const live = new Set(demo() ? DEMO.spaces.map(([id]) => id) : spaces().map((s) => s.id));
     const team = (id) => all.filter((a) => a.space === id).sort((a, b) => b.seq - a.seq);
-    // a space's row, then its agents when it is open
-    const withAgents = (r) => {
+    const sleeping = (gid) => G.dormant.filter((d) => d.group === gid && (d.machine ?? null) === m && !(d.space && live.has(d.space)));
+    const spacesIn = (gid) => rows.filter((r) => r.group === gid);
+    const out = [];
+    const spaceRows = (r, depth, rails, last) => {
       const mine = team(r.w.id), shown = open.has(r.w.id) && mine.length > 0;
-      return [draw({ ...r, team: mine, opened: shown }), ...(shown ? mine.map((a, n) => this.agentRow(a, t, { group: r.group, spaceLast: r.last, last: n === mine.length - 1 })) : [])];
+      out.push(draw({ ...r, team: mine, opened: shown, depth, rails, last }));
+      if (!shown) return;
+      const under = depth ? [...rails, !last] : [];
+      mine.forEach((a, n) => out.push(this.agentRow(a, t, { depth: depth + 1, rails: under, last: n === mine.length - 1 })));
     };
-    const out = rows.filter((r) => !r.group).flatMap(withAgents);
-    for (const name of G.order) {
-      const mine = rows.filter((r) => r.group === name), folded = (G.folded ?? []).includes(name);
-      const loud = loudest(mine.flatMap((r) => team(r.w.id)).filter((a) => a.status !== "idle"));
-      const drop = this.pressed !== null && this.overGroup === name;
-      out.push(h_flex().id(`group-${name}`).h(28).flex_none().px(8).gap(7).items_center().rounded(8).cursor_pointer()
-        .text_color(drop ? t.foreground : t.muted).when(drop, (el) => el.bg(t.selected)).hover((s) => s.bg(t.hover).text_color(t.foreground))
-        .on_click((_e, cx) => {
-          const g = groups(), f = new Set(g.folded ?? []);
-          f.has(name) ? f.delete(name) : f.add(name);
-          saveGroups({ ...g, folded: [...f] });
-          cx.notify();
-        })
-        .on_mouse_down("right", () => openOverlay({ mod: "spaces-tree", kind: "popup", width: 210, height: 110, props: { group: name } }))
-        .on_mouse_move((_e, cx) => { if (this.pressed !== null && this.overGroup !== name) { this.overGroup = name; this.over = null; cx.notify(); } })
-        .on_mouse_up("left", (_e, cx) => {
-          // a space dropped on the header joins the group
-          if (this.pressed !== null && this.overGroup === name) { const g = groups(); saveGroups({ ...g, of: { ...g.of, [this.pressed]: name } }); }
-          this.pressed = null; this.over = null; this.overGroup = null; cx.notify();
-        })
-        .child(svg(`mods/workspace-chrome/chevron-${folded ? "right" : "down"}.svg`).size(10).flex_none().text_color(t.dim))
-        .child(svg(`mods/spaces-tree/${folded ? "folder" : "folder-open"}.svg`).size(15).flex_none().text_color(folded ? t.muted : t.accent))
-        .child(div().flex_1().min_w(0).truncate().font_medium().child(name))
-        .when(folded && Boolean(loud), (el) => el.child(stateIcon(t, loud)))
-        .child(div().flex_none().text_size(10.5).text_color(t.dim).child(String(mine.length))));
-      if (!folded) out.push(...mine.flatMap((r, n) => withAgents({ ...r, last: n === mine.length - 1 })));
-    }
+    const groupRows = (g, depth, rails, last) => {
+      // what it holds at any depth: its count and the loudest state when folded
+      const inside = T.subtree(G, g.id), deep = rows.filter((r) => inside.has(r.group)), isFolded = folded.has(g.id);
+      const loud = loudest(deep.flatMap((r) => team(r.w.id)).filter((a) => a.status !== "idle"));
+      out.push(this.folder(g, t, { depth, rails, last, folded: isFolded, loud, count: deep.length }));
+      if (isFolded) return;
+      const items = [...spacesIn(g.id).map((r) => ["space", r]), ...sleeping(g.id).map((d) => ["dormant", d]), ...T.children(G, g.id).map((c) => ["group", c])];
+      const under = depth ? [...rails, !last] : [];
+      items.forEach(([kind, x], n) => {
+        const l = n === items.length - 1;
+        if (kind === "space") spaceRows(x, depth + 1, under, l);
+        else if (kind === "dormant") out.push(this.dormantRow(x, t, { depth: depth + 1, rails: under, last: l }));
+        else groupRows(x, depth + 1, under, l);
+      });
+    };
+    for (const r of spacesIn(null)) spaceRows(r, 0, [], false);
+    for (const d of sleeping(null)) out.push(this.dormantRow(d, t, { depth: 0, rails: [], last: false }));
+    for (const g of T.roots(G)) groupRows(g, 0, [], false);
     return out;
   }
 
-  // One agent, under its space: the tree's guides, its state, its program, what it is on.
-  agentRow(a, t, { group, spaceLast, last }) {
-    const H = 24, guide = (kind) => div().relative().w(12).h(H).flex_none()
-      .when(kind !== "none", (el) => el.child(div().absolute().left(5).top(0).w(1).h(kind === "elbow" ? H / 2 : H).bg(t.input)))
-      .when(kind === "tee" || kind === "elbow", (el) => el.child(div().absolute().left(5).top(H / 2).w(8).h(1).bg(t.input)));
-    const tab = String(a.tab_name ?? "").trim(), named = tab && !/^\d+$/.test(tab);
-    const title = String(a.title ?? "").replace(/^[^\p{L}\p{N}]+/u, "").trim();
-    return h_flex().id(`agent-${a.address}`).h(H).flex_none().px(8).gap(7).items_center().rounded(7).cursor_pointer()
-      .hover((s) => s.bg(t.hover))
-      .on_click(() => run("agent.focus", { terminal: a.address }))
-      .when(Boolean(group), (el) => el.child(div().ml(4).child(guide(spaceLast ? "none" : "pipe"))))
-      .child(div().ml(group ? 9 : 13).child(guide(last ? "elbow" : "tee")))
-      .child(stateIcon(t, a.status))
-      .child(image(LOGO[a.app] ?? "icons/agent.svg").size(13).flex_none().opacity(a.status === "idle" ? 0.5 : 1))
-      .child(div().flex_shrink(0).max_w(120).truncate().text_size(12).text_color(a.status === "idle" ? t.muted : t.foreground).child(named ? tab : title || a.app || a.address))
-      .when(named && Boolean(title), (el) => el.child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child(title)));
+  // The tree's guides at the left of a row `depth` levels down: a line for each level above it
+  // that still has rows below (rails), then its own line and tick (ending at the tick when last).
+  // Column j's line is under the chevron of the row at depth j that it comes from.
+  guides(t, depth, rails, last, H) {
+    let el = div().relative().w(depth * STEP).h(H).flex_none();
+    rails.forEach((on, j) => { if (on) el = el.child(div().absolute().left(5 + j * STEP).top(0).w(1).h(H).bg(t.input)); });
+    const x = 5 + (depth - 1) * STEP;
+    return el.child(div().absolute().left(x).top(0).w(1).h(last ? H / 2 : H).bg(t.input))
+      .child(div().absolute().left(x).top(H / 2).w(STEP - 9).h(1).bg(t.input));
   }
 
-  // The popups: a space's group (pick), a group's name (group).
+  // A group's folder row. Drag a space or a folder onto it to put it inside; a click folds it.
+  folder(g, t, { depth, rails, last, folded, loud, count }) {
+    const H = 28, id = g.id;
+    const dragging = this.pressed !== null || this.pressedGroup !== null;
+    const drop = dragging && this.overGroup === id && this.pressedGroup !== id;
+    const tint = g.color ? (g.color.startsWith("#") ? g.color : MARK[g.color] ?? t[g.color]) : null;
+    return h_flex().id(`group-${id}`).h(H).flex_none().px(8).items_center().rounded(8).cursor_pointer()
+      .text_color(drop ? t.foreground : t.muted).when(drop, (el) => el.bg(t.selected)).hover((s) => s.bg(t.hover).text_color(t.foreground))
+      .when(this.pressedGroup === id && this.overGroup !== id, (el) => el.opacity(0.5))
+      .on_mouse_down("left", () => { this.pressedGroup = id; this.pressed = null; this.overGroup = id; })
+      .on_mouse_move((_e, cx) => { if ((this.pressed !== null || this.pressedGroup !== null) && this.overGroup !== id) { this.overGroup = id; this.over = null; cx.notify(); } })
+      .on_mouse_up("left", (_e, cx) => {
+        const space = this.pressed, group = this.pressedGroup, over = this.overGroup;
+        this.pressed = null; this.pressedGroup = null; this.over = null; this.overGroup = null;
+        try {
+          if (over === id && space !== null) change((x) => T.putSpace(x, { space, group: id }));
+          else if (over === id && group === id) change((x) => T.foldGroup(x, { group: id }));
+          else if (over === id && group !== null) change((x) => T.moveGroup(x, { group, parent: id }));
+        } catch {}   // a folder dropped into itself, or beside a twin: nothing moves
+        cx.notify();
+      })
+      .on_mouse_down("right", () => openOverlay({ mod: "spaces-tree", kind: "popup", width: 220, height: 150, props: { group: id } }))
+      .when(depth > 0, (el) => el.child(this.guides(t, depth, rails, last, H)))
+      .child(h_flex().flex_1().min_w(0).gap(7).items_center()
+        .child(svg(`mods/workspace-chrome/chevron-${folded ? "right" : "down"}.svg`).size(10).flex_none().text_color(t.dim))
+        .child(svg(`mods/spaces-tree/${folded ? "folder" : "folder-open"}.svg`).size(15).flex_none().text_color(tint ?? (folded ? t.muted : t.accent)))
+        .child(div().flex_1().min_w(0).truncate().font_medium().child(g.name))
+        .when(folded && Boolean(loud), (el) => el.child(stateIcon(t, loud)))
+        .child(div().flex_none().text_size(10.5).text_color(t.dim).child(String(count))));
+  }
+
+  // A dormant entry: a project with no open space. A click opens one there.
+  dormantRow(d, t, { depth, rails, last }) {
+    const H = 30, waking = this.waking?.has(d.id), hot = this.hot === d.id;
+    return h_flex().id(`dormant-${d.id}`).h(H).flex_none().px(8).items_center().rounded(8).cursor_pointer()
+      .hover((s) => s.bg(t.hover)).tooltip(`Dormant: click to open a space in ${d.folder}`)
+      .on_hover((over, cx) => { const next = over ? d.id : this.hot === d.id ? null : this.hot; if (next !== this.hot) { this.hot = next; cx.notify(); } })
+      .on_click((_e, cx) => this.wakeSoon(d.id, cx))
+      .on_mouse_down("right", () => openOverlay({ mod: "spaces-tree", kind: "popup", width: 210, height: 100, props: { dormant: d.id } }))
+      .when(depth > 0, (el) => el.child(this.guides(t, depth, rails, last, H)))
+      .child(h_flex().flex_1().min_w(0).gap(9).items_center()
+        .child(div().w(10).flex_none())
+        .child(h_flex().size(18).flex_none().rounded(5).border(1).border_color(t.dim).items_center().justify_center()
+          .text_size(10.5).font_bold().text_color(t.dim).child([...d.name][0]?.toUpperCase() ?? "?"))
+        .child(div().flex_1().min_w(0).truncate().text_color(t.muted).child(d.name))
+        .when(waking || hot, (el) => el.child(div().flex_none().text_size(10.5).text_color(t.dim).child(waking ? "opening…" : "open"))));
+  }
+
+  wakeSoon(id, cx) {
+    if (demo() || this.popup) return;
+    cx.spawn(async (cx) => {
+      try { await this.wake(id, true, cx); } catch (e) { console.log(`spaces-tree: ${e?.message ?? e}`); }
+      cx.notify();
+    });
+    cx.notify();
+  }
+
+  // One agent, under its space: the tree's guides, its state, its program, what it is on.
+  agentRow(a, t, { depth, rails, last }) {
+    const H = 24;
+    const tab = String(a.tab_name ?? "").trim(), named = tab && !/^\d+$/.test(tab);
+    const title = String(a.title ?? "").replace(/^[^\p{L}\p{N}]+/u, "").trim();
+    return h_flex().id(`agent-${a.address}`).h(H).flex_none().px(8).items_center().rounded(7).cursor_pointer()
+      .hover((s) => s.bg(t.hover))
+      .on_click(() => run("agent.focus", { terminal: a.address }))
+      .child(this.guides(t, depth, rails, last, H))
+      .child(h_flex().flex_1().min_w(0).gap(7).items_center()
+        .child(stateIcon(t, a.status))
+        .child(image(LOGO[a.app] ?? "icons/agent.svg").size(13).flex_none().opacity(a.status === "idle" ? 0.5 : 1))
+        .child(div().flex_shrink(0).max_w(120).truncate().text_size(12).text_color(a.status === "idle" ? t.muted : t.foreground).child(named ? tab : title || a.app || a.address))
+        .when(named && Boolean(title), (el) => el.child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child(title))));
+  }
+
+  // The popups' fields: a space's new group (a path makes the groups on the way), a group's new name.
   entered(cx) {
-    const text = this.input.value().trim(), g = groups();
-    if (props()?.pick) {
-      if (!text) return;
-      const name = g.order.find((n) => n.toLowerCase() === text.toLowerCase()) ?? text;
-      saveGroups({ ...g, order: g.order.includes(name) ? g.order : [...g.order, name], of: { ...g.of, [props().pick]: name } });
-    } else if (text && text !== props().group && !g.order.includes(text)) {
-      const old = props().group;
-      saveGroups({ order: g.order.map((n) => (n === old ? text : n)), of: Object.fromEntries(Object.entries(g.of).map(([id, n]) => [id, n === old ? text : n])),
-        folded: (g.folded ?? []).map((n) => (n === old ? text : n)) });
-    }
+    const text = this.input.value().trim();
+    try {
+      if (props()?.pick) {
+        if (!text) return;
+        change((t) => {
+          let parent = null;
+          for (const name of text.split("/").map((s) => s.trim()).filter(Boolean)) parent = T.addGroup(t, { name, parent }).id;
+          if (parent) T.putSpace(t, { space: props().pick, group: parent });
+        });
+      } else if (props()?.group && text) {
+        change((t) => T.renameGroup(t, { group: props().group, name: text }));
+      }
+    } catch {}   // a name with "/" or one its siblings have: nothing changes
     closeOverlay(props().overlay);
   }
 
   popupView(t) {
-    const g = groups(), id = props()?.pick, now = id ? g.of[id] ?? null : null;
-    const item = (key, label, on, act, color) => h_flex().id(key).h(26).px(10).gap(8).items_center().rounded(6).cursor_pointer().text_size(12.5)
+    const G = tree(), close = () => closeOverlay(props().overlay);
+    const item = (key, label, on, act, color, indent = 0) => h_flex().id(key).h(26).px(10).gap(8).items_center().rounded(6).cursor_pointer().text_size(12.5)
       .text_color(color ?? t.foreground).hover((s) => s.bg(t.hover))
-      .on_click(() => { act(); closeOverlay(props().overlay); })
-      .child(div().w(12).flex_none().text_color(t.accent).child(on ? "✓" : "")).child(div().flex_1().min_w(0).truncate().child(label));
-    const field = Input.new(this.input).h(26).mx(6).px(8).rounded(6).bg(t.input).text_size(12.5);
+      .on_click(() => { try { act(); } catch {} close(); })
+      .child(div().w(12).flex_none().text_color(t.accent).child(on ? "✓" : ""))
+      .child(div().flex_1().min_w(0).truncate().pl(indent * 12).child(label));
     const root = v_flex().size_full().p(4).gap(1).bg(t.popover).text_color(t.foreground);
+    const gone = () => root.child(div().px(10).py(4).text_size(12).text_color(t.dim).child("It is gone."));
+    if (props()?.dormant) {
+      const d = G.dormant.find((x) => x.id === props().dormant);
+      if (!d) return gone();
+      return root.child(div().px(10).pt(4).pb(2).text_size(11).text_color(t.dim).truncate().child(d.folder))
+        .child(item("dormant-open", "Open a space here", false, () => setShared(WAKE, { id: d.id, at: Date.now() })))
+        .child(item("dormant-remove", "Remove from the tree", false, () => change((x) => T.removeDormant(x, { dormant: d.id })), t.blocked));
+    }
+    const field = Input.new(this.input).h(26).mx(6).px(8).rounded(6).bg(t.input).text_size(12.5);
+    const id = props()?.pick;
     if (id) {
+      const now = G.of[id] && T.byId(G, G.of[id]) ? G.of[id] : null;
+      const list = Object.entries(T.ranks(G)).sort((a, b) => a[1] - b[1]).map(([gid]) => T.byId(G, gid));
       return root
-        .children(g.order.map((n) => item(`pick-${n}`, n, n === now, () => saveGroups({ ...groups(), of: { ...groups().of, [id]: n } }))))
-        .child(item("pick-none", "No group", !now, () => { const x = groups(), of = { ...x.of }; delete of[id]; saveGroups({ ...x, of }); }, t.muted))
+        .children(list.map((g) => item(`pick-${g.id}`, g.name, g.id === now, () => change((x) => T.putSpace(x, { space: id, group: g.id })), null, T.depthOf(G, g.id))))
+        .child(item("pick-none", "No group", !now, () => change((x) => T.putSpace(x, { space: id, group: null })), t.muted))
         .child(div().h(1).my(3).bg(t.border)).child(field);
     }
+    const g = T.byId(G, props()?.group);
+    if (!g) return gone();
     return root.child(div().px(10).pt(4).pb(2).text_size(11).text_color(t.dim).child("Rename the group")).child(field)
       .child(div().h(1).my(3).bg(t.border))
-      .child(item("group-delete", "Delete the group", false, () => {
-        const x = groups(), old = props().group;
-        saveGroups({ order: x.order.filter((n) => n !== old), of: Object.fromEntries(Object.entries(x.of).filter(([, n]) => n !== old)), folded: (x.folded ?? []).filter((n) => n !== old) });
-      }, t.blocked));
+      .when(Boolean(g.parent), (el) => el.child(item("group-top", "Move to the top level", false, () => change((x) => T.moveGroup(x, { group: g.id, parent: null })))))
+      .child(item("group-delete", "Delete the group", false, () => change((x) => T.removeGroup(x, { group: g.id })), t.blocked));
   }
 
   // Only what's unusual, after the name: "herdr \u00b7 spike \u21912 \u21931". The repo or
@@ -545,7 +827,7 @@ export default class Spaces extends View {
       .when(g.behind > 0, (el) => el.child(div().flex_none().text_color(t.ansi1).child(`\u2193${g.behind}`)));
   }
 
-  row({ w, i, g, tree, group, last, team = [], opened = false }, t) {
+  row({ w, i, g, tree, last, team = [], opened = false, depth = 0, rails = [] }, t) {
     const loud = loudest(team.filter((a) => a.status !== "idle"));
     const on = w.active;
     const fromIndex = this.pressed === null ? -1 : spaces().findIndex(s => s.id === this.pressed);
@@ -580,6 +862,9 @@ export default class Spaces extends View {
           this.over = over;
           this.overGroup = null;
           cx.notify();
+        } else if (this.pressedGroup !== null && this.overGroup !== null) {   // a folder dragged: not onto a space
+          this.overGroup = null;
+          cx.notify();
         }
       })
       .on_mouse_up("left", (_e, cx) => {
@@ -589,23 +874,22 @@ export default class Spaces extends View {
         this.over = null;
         if (from !== null && over === w.id && from !== w.id) {
           // dropped on a space: beside it, and into its group
-          const G = groups(), of = { ...G.of };
-          if (G.of[w.id]) of[from] = G.of[w.id]; else delete of[from];
-          saveGroups({ ...G, of });
+          const G = tree();
+          change((x) => T.putSpace(x, { space: from, group: G.of[w.id] && T.byId(G, G.of[w.id]) ? G.of[w.id] : null }));
           const index = spaces().findIndex(s => s.id === w.id);
           if (index !== -1) run("space.move", { id: from, index: index + 1 });
         } else if (from === w.id) run("space.select", { id: w.id });
         cx.notify();
       })
       .on_mouse_down("right", () => this.menu(w))
-      .child(
-        h_flex()
+      .child(h_flex().items_center()
+        // in a group: the tree's guides, down from the folder with a tick to this row
+        .when(depth > 0, (el) => el.child(this.guides(t, depth, rails, last, rowHeight({ tree }))))
+        .child(h_flex()
+          .flex_1()
+          .min_w(0)
           .gap(9)
           .items_center()
-          // in a group: the tree's guide, a line down from the folder with a tick to this row
-          .when(Boolean(group), (el) => el.child(div().relative().w(12).h(rowHeight({ tree })).flex_none().ml(4)
-            .child(div().absolute().left(5).top(0).w(1).h(last ? rowHeight({ tree }) / 2 : rowHeight({ tree })).bg(t.input))
-            .child(div().absolute().left(5).top(rowHeight({ tree }) / 2).w(9).h(1).bg(t.input))))
           // a space with agents opens: the chevron shows or hides them
           .child(div().id(`open-${w.id}`).w(10).h(18).flex_none().flex().items_center().justify_center().rounded(3)
             .when(team.length > 0, (el) => el.cursor_pointer().hover((s) => s.bg(t.raised))
@@ -613,9 +897,7 @@ export default class Spaces extends View {
               .on_mouse_up("left", (_e, cx) => {
                 cx.stop_propagation();
                 this.pressed = null;
-                const G = groups(), set = new Set(G.open ?? []);
-                set.has(w.id) ? set.delete(w.id) : set.add(w.id);
-                saveGroups({ ...G, open: [...set] });
+                change((x) => { const set = new Set(x.open); set.has(w.id) ? set.delete(w.id) : set.add(w.id); x.open = [...set]; });
                 cx.notify();
               })
               .child(svg(`mods/workspace-chrome/chevron-${opened ? "down" : "right"}.svg`).size(9).text_color(t.dim))))
@@ -636,7 +918,7 @@ export default class Spaces extends View {
               this.pressed = null;
               openOverlay({ mod: "spaces-tree", kind: "popup", width: 190, height: 320, props: { pick: w.id } });
             })
-            .child("⋯"))),
+            .child("⋯")))),
       );
   }
 
@@ -673,13 +955,25 @@ export default class Spaces extends View {
     }
     if (changed && !demo()) setShared("space.colors", kept);   // the demo never touches the real colours
     return v_flex().size_full().min_h(0).bg(t.chrome).text_size(13)
-      .child(h_flex().h(31).pl(16).pr(10).items_center().justify_between().text_size(11.5).text_color(t.dim)
+      .child(h_flex().id("spaces-title").h(31).pl(16).pr(10).items_center().justify_between().text_size(11.5).text_color(t.dim)
         .when(collapsed, el => el.pl(0).pr(0).justify_center())
+        // a space or a folder dropped on the title leaves every group
+        .when(!collapsed && (this.pressed !== null || this.pressedGroup !== null) && this.overGroup === TOP, el => el.bg(t.selected).text_color(t.foreground))
+        .on_mouse_move((_e, cx) => { if ((this.pressed !== null || this.pressedGroup !== null) && this.overGroup !== TOP) { this.overGroup = TOP; this.over = null; cx.notify(); } })
+        .on_mouse_up("left", (_e, cx) => {
+          const space = this.pressed, group = this.pressedGroup, over = this.overGroup;
+          this.pressed = null; this.pressedGroup = null; this.over = null; this.overGroup = null;
+          try {
+            if (over === TOP && space !== null) change((x) => T.putSpace(x, { space, group: null }));
+            else if (over === TOP && group !== null) change((x) => T.moveGroup(x, { group, parent: null }));
+          } catch {}
+          cx.notify();
+        })
         .when(!collapsed, el => el.child("Spaces"))
         .child(div().id("space-new").size(26).flex_none().flex().items_center().justify_center().rounded(6).hover(s => s.bg(t.hover).text_color(t.foreground))
           .on_click(() => run("space.new")).child(svg("mods/workspace-chrome/plus.svg").size(14))))
       .child(v_flex().flex_1().min_h(0).px(collapsed ? 0 : 8).pb(14).overflow_y_scrollbar().mode("always")
-        .on_mouse_up("left", (_e, cx) => { this.pressed = null; cx.notify(); })
+        .on_mouse_up("left", (_e, cx) => { this.pressed = null; this.pressedGroup = null; this.overGroup = null; cx.notify(); })
         .children(this.grouped(t, collapsed)));
   }
 }

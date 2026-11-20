@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""spaces-tree: change the Spaces Tree sidebar of a running Herdr app from a shell.
+
+Each call writes one request into <app home>/data/spaces-tree/inbox, nudges the mod with
+`herdr-app do spaces-tree.inbox`, and prints the mod's JSON answer. Exit code 0 on success,
+1 when the mod refused the request, 2 when it did not answer (nothing changed).
+
+  spaces-tree list [--text]
+  spaces-tree group add NAME [--parent GROUP] [--color COLOR]
+  spaces-tree group rename GROUP NAME
+  spaces-tree group rm GROUP                     (what it held goes up one level)
+  spaces-tree group move GROUP (--parent GROUP | --top) [--before GROUP]
+  spaces-tree group color GROUP (COLOR | none)   (teal orange blue purple green pink, ansi0..15, #rrggbb)
+  spaces-tree group fold GROUP | group unfold GROUP
+  spaces-tree space put SPACE (--group GROUP | --none) [--first | --before SPACE]
+  spaces-tree dormant add NAME --folder DIR [--group GROUP] [--argv ARGV] [--machine NAME]
+  spaces-tree dormant add --space SPACE [--name NAME] [--group GROUP] [--argv ARGV]
+  spaces-tree dormant open ENTRY [--focus]
+  spaces-tree dormant put ENTRY (--group GROUP | --none)
+  spaces-tree dormant rm ENTRY
+  spaces-tree raw '{"op": "...", "args": {...}}'
+
+GROUP: a group id, a path ("Personal/Tools") or a name only one group has.
+SPACE: a space id from `herdr-app ls`, or a name only one space has.
+ENTRY: a dormant entry id, or a name only one entry has.
+ARGV: a JSON list ('["claude"]') or a command line ("claude --continue").
+Options for every call: --timeout SECONDS (default 20).
+"""
+
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+import uuid
+
+
+def die(msg, code=2):
+    print(json.dumps({"ok": False, "error": msg}))
+    sys.exit(code)
+
+
+def home():
+    return os.environ.get("HERDR_APP_HOME") or os.path.expanduser("~/.config/herdr-app")
+
+
+def take(args, flag, has_value=True):
+    """Removes --flag [value] from args; returns the value, True for a bare flag, None if absent."""
+    if flag not in args:
+        return None
+    i = args.index(flag)
+    if not has_value:
+        del args[i]
+        return True
+    if i + 1 >= len(args):
+        die(f"{flag} needs a value", 1)
+    value = args[i + 1]
+    del args[i:i + 2]
+    return value
+
+
+def argv_of(text):
+    if text is None:
+        return None
+    text = text.strip()
+    if text.startswith("["):
+        try:
+            value = json.loads(text)
+        except ValueError as e:
+            die(f"--argv: {e}", 1)
+        if not (isinstance(value, list) and all(isinstance(a, str) for a in value)):
+            die("--argv: a JSON list of strings", 1)
+        return value
+    return shlex.split(text)
+
+
+def where(args):
+    """--group GROUP | --none -> the group ref (None: out of every group)."""
+    none = take(args, "--none", has_value=False)
+    group = take(args, "--group")
+    if none and group:
+        die("give --group or --none, not both", 1)
+    if not none and group is None:
+        die("give --group GROUP or --none", 1)
+    return None if none else group
+
+
+def parse(args):
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        sys.exit(0)
+    what = args.pop(0)
+    if what == "list":
+        return {"op": "list", "args": {}}
+    if what == "raw":
+        if len(args) != 1:
+            die("raw takes one JSON object", 1)
+        try:
+            request = json.loads(args[0])
+        except ValueError as e:
+            die(f"raw: {e}", 1)
+        if not isinstance(request, dict) or "op" not in request:
+            die('raw: {"op": "...", "args": {...}}', 1)
+        return request
+    if not args:
+        die(f"{what} what? See spaces-tree --help", 1)
+    verb = args.pop(0)
+    op, a = f"{what}.{verb}", {}
+    if what == "group":
+        if verb == "add":
+            a["parent"] = take(args, "--parent")
+            a["color"] = take(args, "--color")
+            a["name"] = args.pop(0) if args else die("group add NAME", 1)
+        elif verb == "rename":
+            if len(args) != 2:
+                die("group rename GROUP NAME", 1)
+            a["group"], a["name"] = args.pop(0), args.pop(0)
+        elif verb == "rm":
+            a["group"] = args.pop(0) if args else die("group rm GROUP", 1)
+        elif verb == "move":
+            top = take(args, "--top", has_value=False)
+            parent = take(args, "--parent")
+            if bool(top) == (parent is not None):
+                die("group move GROUP (--parent GROUP | --top)", 1)
+            a["parent"] = parent
+            a["before"] = take(args, "--before")
+            a["group"] = args.pop(0) if args else die("group move GROUP", 1)
+        elif verb == "color":
+            if len(args) != 2:
+                die("group color GROUP COLOR (or none)", 1)
+            a["group"], color = args.pop(0), args.pop(0)
+            a["color"] = None if color.lower() in ("none", "off", "") else color
+        elif verb in ("fold", "unfold"):
+            op = "group.fold"
+            a["folded"] = verb == "fold"
+            a["group"] = args.pop(0) if args else die(f"group {verb} GROUP", 1)
+        else:
+            die(f"unknown: group {verb}", 1)
+    elif what == "space":
+        if verb != "put":
+            die(f"unknown: space {verb}", 1)
+        a["first"] = bool(take(args, "--first", has_value=False))
+        a["before"] = take(args, "--before")
+        a["group"] = where(args)
+        a["space"] = args.pop(0) if args else die("space put SPACE", 1)
+    elif what == "dormant":
+        if verb == "add":
+            a["space"] = take(args, "--space")
+            a["folder"] = take(args, "--folder")
+            a["machine"] = take(args, "--machine")
+            a["argv"] = argv_of(take(args, "--argv"))
+            name = take(args, "--name")
+            if "--group" in args:
+                a["group"] = take(args, "--group")
+            elif "--none" in args:
+                take(args, "--none", has_value=False)
+                a["group"] = None
+            a["name"] = name or (args.pop(0) if args else None)
+            if a["folder"]:
+                a["folder"] = os.path.abspath(os.path.expanduser(a["folder"])) if not a["machine"] else a["folder"]
+            if not a["space"] and not (a["name"] and a["folder"]):
+                die("dormant add NAME --folder DIR, or dormant add --space SPACE", 1)
+            a = {k: v for k, v in a.items() if v is not None or k == "group"}
+        elif verb == "open":
+            a["focus"] = bool(take(args, "--focus", has_value=False))
+            a["dormant"] = args.pop(0) if args else die("dormant open ENTRY", 1)
+        elif verb == "put":
+            a["group"] = where(args)
+            a["dormant"] = args.pop(0) if args else die("dormant put ENTRY", 1)
+        elif verb == "rm":
+            a["dormant"] = args.pop(0) if args else die("dormant rm ENTRY", 1)
+        else:
+            die(f"unknown: dormant {verb}", 1)
+    else:
+        die(f"unknown: {what}. See spaces-tree --help", 1)
+    if args:
+        die(f"unexpected: {' '.join(args)}", 1)
+    return {"op": op, "args": a}
+
+
+def text_tree(answer):
+    lines = []
+
+    def space(s, pad):
+        mark = f" [{s['status']}]" if s.get("status") else ""
+        lines.append(f"{pad}{s['name']}  ({s['id']}){mark}")
+
+    def sleeper(d, pad):
+        state = f"open as {d['space']}" if d["open"] else "dormant"
+        lines.append(f"{pad}~ {d['name']}  ({d['id']}, {state}) {d['folder']}")
+
+    def group(g, pad):
+        lines.append(f"{pad}{g['name']}/  ({g['id']}){' folded' if g['folded'] else ''}{' ' + g['color'] if g['color'] else ''}")
+        for s in g["spaces"]:
+            space(s, pad + "  ")
+        for d in g["dormant"]:
+            sleeper(d, pad + "  ")
+        for c in g["groups"]:
+            group(c, pad + "  ")
+
+    for s in answer["ungrouped"]["spaces"]:
+        space(s, "")
+    for d in answer["ungrouped"]["dormant"]:
+        sleeper(d, "")
+    for g in answer["groups"]:
+        group(g, "")
+    return "\n".join(lines)
+
+
+def main():
+    args = sys.argv[1:]
+    timeout = float(take(args, "--timeout") or 20)
+    text = bool(take(args, "--text", has_value=False))
+    request = parse(args)
+
+    root = os.path.join(home(), "data", "spaces-tree")
+    inbox, outbox = os.path.join(root, "inbox"), os.path.join(root, "outbox")
+    os.makedirs(inbox, exist_ok=True)
+    os.makedirs(outbox, exist_ok=True)
+    rid = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+    path, answer_path = os.path.join(inbox, f"{rid}.json"), os.path.join(outbox, f"{rid}.json")
+    tmp = os.path.join(inbox, f".{rid}.tmp")
+    with open(tmp, "w") as f:
+        json.dump(request, f)
+    os.replace(tmp, path)
+    try:   # look now; the mod's folder watch would also see it
+        subprocess.run(["herdr-app", "do", "spaces-tree.inbox"], capture_output=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    end = time.time() + timeout
+    while time.time() < end:
+        if os.path.exists(answer_path):
+            try:
+                with open(answer_path) as f:
+                    answer = json.load(f)
+            except ValueError:   # still being written
+                time.sleep(0.05)
+                continue
+            os.remove(answer_path)
+            if text and answer.get("ok") and request["op"] == "list":
+                print(text_tree(answer))
+            else:
+                print(json.dumps(answer, indent=2, ensure_ascii=False))
+            sys.exit(0 if answer.get("ok") else 1)
+        time.sleep(0.05)
+
+    try:
+        os.remove(path)   # never taken: withdraw it, so it doesn't happen later
+        die(f"no answer in {timeout:g} s; nothing changed. Is the Spaces Tree mod in the shown Herdr layout?")
+    except FileNotFoundError:
+        die(f"the mod took the request but did not answer in {timeout:g} s; check with `spaces-tree list` before repeating it")
+
+
+if __name__ == "__main__":
+    main()
