@@ -3,7 +3,10 @@
 //
 // v2, in shared "spaces-tree.tree":
 //   { v: 2,
-//     groups:  [{ id, name, parent: groupId | null, color: string | null }]   (sibling order = array order)
+//     groups:  [{ id, name, parent: groupId | null, color: string | null,      (sibling order = array order)
+//                 head: null | { space: spaceId | null, machine, dormant: entryId | null } }]
+//              a group with a head shows that space as its row (a branch headed by a space);
+//              with `dormant`, the head is that entry: its open space, else the entry itself.
 //     of:      { spaceId: groupId }                                           (a space's group)
 //     folded:  [groupId], open: [spaceId]                                     (folded groups, spaces showing agents)
 //     dormant: [{ id, name, folder, argv: string[] | null, machine: string | null,
@@ -30,7 +33,7 @@ export function migrate(v1) {
   v1.order.forEach((name, i) => {
     if (typeof name !== "string" || ids[name]) return;
     ids[name] = `g${i + 1}`;
-    t.groups.push({ id: ids[name], name, parent: null, color: null });
+    t.groups.push({ id: ids[name], name, parent: null, color: null, head: null });
   });
   for (const [space, name] of Object.entries(v1.of ?? {})) if (ids[name]) t.of[space] = ids[name];
   t.folded = (v1.folded ?? []).map((n) => ids[n]).filter(Boolean);
@@ -46,7 +49,11 @@ export function normalize(raw) {
   for (const g of Array.isArray(raw.groups) ? raw.groups : []) {
     if (!g || typeof g.id !== "string" || seen.has(g.id) || typeof g.name !== "string") continue;
     seen.add(g.id);
-    t.groups.push({ id: g.id, name: g.name, parent: typeof g.parent === "string" ? g.parent : null, color: typeof g.color === "string" ? g.color : null });
+    const h = g.head && typeof g.head === "object" ? g.head : null;
+    const head = h && (typeof h.space === "string" || typeof h.dormant === "string")
+      ? { space: typeof h.space === "string" ? h.space : null, machine: typeof h.machine === "string" && h.machine ? h.machine : null, dormant: typeof h.dormant === "string" ? h.dormant : null }
+      : null;
+    t.groups.push({ id: g.id, name: g.name, parent: typeof g.parent === "string" ? g.parent : null, color: typeof g.color === "string" ? g.color : null, head });
   }
   for (const g of t.groups) if (g.parent && !seen.has(g.parent)) g.parent = null;
   for (const g of t.groups) {   // a parent chain that comes back to itself: cut it here
@@ -70,6 +77,10 @@ export function normalize(raw) {
       group: seen.has(d.group) ? d.group : null,
       space: typeof d.space === "string" ? d.space : null,
     });
+  }
+  for (const g of t.groups) {   // a head entry that is gone: its space, if any, stays the head
+    if (g.head?.dormant && !dseen.has(g.head.dormant)) g.head.dormant = null;
+    if (g.head && !g.head.space && !g.head.dormant) g.head = null;
   }
   return t;
 }
@@ -167,7 +178,7 @@ export function addGroup(t, { name, parent = null, color = null }) {
     return { id: checked.twin.id, path: pathOf(t, checked.twin.id), existed: true };
   }
   const id = newId(t, "g");
-  t.groups.push({ id, name: checked.name, parent: pid, color: checkColor(color) });
+  t.groups.push({ id, name: checked.name, parent: pid, color: checkColor(color), head: null });
   return { id, path: pathOf(t, id), existed: false };
 }
 
@@ -222,12 +233,53 @@ export function foldGroup(t, { group, folded }) {
 }
 
 // group null: out of every group. A dormant entry that backs the space moves with it.
+// A head that leaves its group stops being its head.
 export function putSpace(t, { space, group = null }) {
   if (typeof space !== "string" || !space) fail("which space?");
   const gid = resolve(t, group);
   if (gid) t.of[space] = gid; else delete t.of[space];
   for (const d of t.dormant) if (d.space === space) d.group = gid;
+  for (const g of t.groups) if (g.id !== gid && headSpace(t, g) === space) g.head = null;
   return { space, group: gid, path: gid ? pathOf(t, gid) : null };
+}
+
+// The space a group's head has open now (null: none; the head may still be a dormant entry).
+export function headSpace(t, g) {
+  if (!g?.head) return null;
+  if (g.head.dormant) return t.dormant.find((d) => d.id === g.head.dormant)?.space ?? null;
+  return g.head.space;
+}
+
+// A space heads a group: the group's row shows it. It joins the group and stops heading any
+// other. A space that backs a dormant entry heads it as that entry, so when the space closes the
+// row shows the entry. `dormant` alone: a dormant entry heads the group.
+// Neither: the group is a plain folder again; its head stays in it as a space.
+export function setHead(t, { group, space = null, machine = null, dormant = null }) {
+  const id = resolve(t, group) ?? fail("which group?");
+  const g = byId(t, id);
+  if (!space && !dormant) { g.head = null; return { id, head: null }; }
+  const d = dormant ? resolveDormant(t, dormant) : t.dormant.find((x) => x.space === space) ?? null;
+  const live = space ?? d?.space ?? null;
+  for (const x of t.groups) {
+    if (x.id === id || !x.head) continue;
+    if ((live && headSpace(t, x) === live) || (d && x.head.dormant === d.id)) x.head = null;
+  }
+  g.head = { space: live, machine: d ? d.machine : machine || null, dormant: d ? d.id : null };
+  if (live) t.of[live] = id;
+  if (d) d.group = id;
+  return { id, path: pathOf(t, id), head: { space: live, dormant: d ? d.id : null } };
+}
+
+// Heads (with no dormant entry) whose space is gone: the group is a plain folder again.
+// `live(space, machine)`: false once it is known to be gone.
+export function settleHeads(t, live) {
+  let changed = false;
+  for (const g of t.groups) {
+    if (!g.head || g.head.dormant || !g.head.space || live(g.head.space, g.head.machine) !== false) continue;
+    g.head = null;
+    changed = true;
+  }
+  return changed;
 }
 
 export function resolveDormant(t, ref) {
@@ -254,6 +306,7 @@ export function addDormant(t, { name, folder, argv = null, machine = null, group
 export function putDormant(t, { dormant, group = null }) {
   const d = resolveDormant(t, dormant);
   d.group = resolve(t, group);
+  for (const g of t.groups) if (g.head?.dormant === d.id && g.id !== d.group) g.head = null;
   if (d.space) { if (d.group) t.of[d.space] = d.group; else delete t.of[d.space]; }
   return { id: d.id, group: d.group };
 }
@@ -262,6 +315,7 @@ export function putDormant(t, { dormant, group = null }) {
 export function removeDormant(t, { dormant }) {
   const d = resolveDormant(t, dormant);
   t.dormant = t.dormant.filter((x) => x.id !== d.id);
+  for (const g of t.groups) if (g.head?.dormant === d.id) g.head = d.space ? { space: d.space, machine: d.machine, dormant: null } : null;
   return { id: d.id, space: d.space };
 }
 

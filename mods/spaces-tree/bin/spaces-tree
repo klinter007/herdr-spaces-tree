@@ -12,6 +12,8 @@ Each call writes one request into <app home>/data/spaces-tree/inbox, nudges the 
   spaces-tree group move GROUP (--parent GROUP | --top) [--before GROUP]
   spaces-tree group color GROUP (COLOR | none)   (teal orange blue purple green pink, ansi0..15, #rrggbb)
   spaces-tree group fold GROUP | group unfold GROUP
+  spaces-tree group head GROUP (SPACE | --dormant ENTRY | --none)
+                                                 (the group's row shows that space: a branch with a head)
   spaces-tree space put SPACE (--group GROUP | --none) [--first | --before SPACE]
   spaces-tree dormant add NAME --folder DIR [--group GROUP] [--argv ARGV] [--machine NAME]
   spaces-tree dormant add --space SPACE [--name NAME] [--group GROUP] [--argv ARGV]
@@ -131,6 +133,19 @@ def parse(args):
                 die("group color GROUP COLOR (or none)", 1)
             a["group"], color = args.pop(0), args.pop(0)
             a["color"] = None if color.lower() in ("none", "off", "") else color
+        elif verb == "head":
+            none = take(args, "--none", has_value=False)
+            dormant = take(args, "--dormant")
+            if not args:
+                die("group head GROUP (SPACE | --dormant ENTRY | --none)", 1)
+            a["group"] = args.pop(0)
+            space = args.pop(0) if args else None
+            if sum(x is not None and x is not False for x in (none, dormant, space)) != 1:
+                die("group head GROUP (SPACE | --dormant ENTRY | --none)", 1)
+            if space:
+                a["space"] = space
+            if dormant:
+                a["dormant"] = dormant
         elif verb in ("fold", "unfold"):
             op = "group.fold"
             a["folded"] = verb == "fold"
@@ -186,16 +201,26 @@ def text_tree(answer):
         mark = f" [{s['status']}]" if s.get("status") else ""
         lines.append(f"{pad}{s['name']}  ({s['id']}){mark}")
 
+    def headed(h):
+        if not h:
+            return ""
+        what = h["space"] if h["open"] else f"dormant {h['dormant']}"
+        return f"  headed by {h['name']} ({what})"
+
+
     def sleeper(d, pad):
         state = f"open as {d['space']}" if d["open"] else "dormant"
         lines.append(f"{pad}~ {d['name']}  ({d['id']}, {state}) {d['folder']}")
 
     def group(g, pad):
-        lines.append(f"{pad}{g['name']}/  ({g['id']}){' folded' if g['folded'] else ''}{' ' + g['color'] if g['color'] else ''}")
+        lines.append(f"{pad}{g['name']}/  ({g['id']}){' folded' if g['folded'] else ''}{' ' + g['color'] if g['color'] else ''}{headed(g.get('head'))}")
         for s in g["spaces"]:
+            if s.get("head"):
+                continue
             space(s, pad + "  ")
         for d in g["dormant"]:
-            sleeper(d, pad + "  ")
+            if not (g.get("head") and g["head"].get("dormant") == d["id"]):
+                sleeper(d, pad + "  ")
         for c in g["groups"]:
             group(c, pad + "  ")
 

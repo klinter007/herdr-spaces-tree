@@ -9,6 +9,8 @@
 // folded group still says when a space in it works or needs you. Drag a space or a group onto
 // a folder to put it there (onto the "Spaces" title: out of every group), or use the dots at
 // the right of a hovered row. A right click on a folder renames, lifts or deletes the group.
+// A group can have a head: a space shown as the group's row in place of a folder (a lead
+// space with its helpers under it). A click on it shows that space; its chevron folds.
 // A dormant entry is a project with no open space: a click opens a space there, and when that
 // space closes the entry sleeps again in the same place.
 // The agents are in the same tree, in place of the separate Agents list: a space with agents has
@@ -83,7 +85,7 @@ const loudest = (list) => LOUD.find((s) => list.some((a) => a.status === s)) ?? 
 const DEMO = {
   tree: T.normalize({
     v: 2,
-    groups: [{ id: "g1", name: "Work", parent: null }, { id: "g2", name: "Design", parent: "g1", color: "ansi5" }, { id: "g3", name: "Side projects", parent: null, color: "ansi2" }, { id: "g4", name: "Home", parent: null }],
+    groups: [{ id: "g1", name: "Work", parent: null, head: { space: "s1" } }, { id: "g2", name: "Design", parent: "g1", color: "ansi5" }, { id: "g3", name: "Side projects", parent: null, color: "ansi2" }, { id: "g4", name: "Home", parent: null }],
     of: { s1: "g1", s2: "g1", s3: "g2", s4: "g3", s5: "g3", s6: "g4" }, folded: ["g4"], open: ["s1"],
     dormant: [{ id: "d1", name: "billing-service", folder: "~/code/billing", group: "g1" }, { id: "d2", name: "old-blog", folder: "~/code/blog", group: "g3" }],
   }),
@@ -167,17 +169,16 @@ export default class Spaces extends View {
 
   // A dormant entry whose space closed sleeps again. Only once that space's machine is readable,
   // so a slow start or a machine away doesn't look like a close.
+  // A head space that closed (with no dormant entry) leaves its group a plain folder.
   settleDormant(sp) {
-    if (!shared(T.TREE)) return;   // v1 has no dormant entries
+    if (!shared(T.TREE)) return;   // v1 has no dormant entries or heads
     const t = tree();
-    if (!t.dormant.some((d) => d.space)) return;
+    if (!t.dormant.some((d) => d.space) && !t.groups.some((g) => g.head?.space && !g.head.dormant)) return;
     const ids = new Set(sp.map((s) => s.id));
-    const live = (d) => {
-      if (this.waking.has(d.id)) return null;
-      const m = machines().find((k) => (k.name ?? null) === (d.machine ?? null));
-      return m?.layout === "ready" ? ids.has(d.space) : null;
-    };
-    if (T.settle(t, live)) saveTree(t);
+    const ready = (machine) => machines().find((k) => (k.name ?? null) === (machine ?? null))?.layout === "ready";
+    const live = (d) => (this.waking.has(d.id) ? null : ready(d.machine) ? ids.has(d.space) : null);
+    const slept = T.settle(t, live), lost = T.settleHeads(t, (space, machine) => (ready(machine) ? ids.has(space) : null));
+    if (slept || lost) saveTree(t);
   }
 
   // The agent API. bin/spaces-tree writes a request, <id>.json = { op, args }, into
@@ -261,6 +262,13 @@ export default class Spaces extends View {
       case "group.move": return change((t) => T.moveGroup(t, a));
       case "group.color": return change((t) => T.colorGroup(t, a));
       case "group.fold": return change((t) => T.foldGroup(t, a));
+      case "group.head": {   // { group, space } | { group, dormant } | { group } (no head)
+        if (a.space) {
+          const s = this.findSpace(a.space);
+          return change((t) => T.setHead(t, { group: a.group, space: s.id, machine: s.machine ?? null }));
+        }
+        return change((t) => T.setHead(t, { group: a.group, dormant: a.dormant ?? null }));
+      }
       case "space.put": {
         const s = this.findSpace(a.space);
         const r = change((t) => T.putSpace(t, { space: s.id, group: a.group ?? null }));
@@ -302,9 +310,14 @@ export default class Spaces extends View {
     const space = (s) => ({ id: s.id, name: s.name, folder: s.folder, machine: s.machine ?? null, status: s.status ?? null, ...(backs[s.id] ? { dormant: backs[s.id] } : {}) });
     const sleeper = (d) => ({ id: d.id, name: d.name, folder: d.folder, argv: d.argv, machine: d.machine, open: Boolean(d.space && live.has(d.space)), space: d.space && live.has(d.space) ? d.space : null });
     const inGroup = (s) => Boolean(t.of[s.id] && T.byId(t, t.of[s.id]));
+    const head = (g) => {
+      if (!g.head) return null;
+      const id = T.headSpace(t, g), s = id ? sp.find((x) => x.id === id) : null, d = g.head.dormant ? t.dormant.find((x) => x.id === g.head.dormant) : null;
+      return { space: s ? s.id : null, name: s?.name ?? d?.name ?? null, open: Boolean(s), dormant: d ? d.id : null };
+    };
     const node = (g) => ({
-      id: g.id, name: g.name, path: T.pathOf(t, g.id), color: g.color, folded: t.folded.includes(g.id),
-      spaces: sp.filter((s) => t.of[s.id] === g.id).map(space),
+      id: g.id, name: g.name, path: T.pathOf(t, g.id), color: g.color, folded: t.folded.includes(g.id), head: head(g),
+      spaces: sp.filter((s) => t.of[s.id] === g.id).map((s) => (T.headSpace(t, g) === s.id ? { ...space(s), head: true } : space(s))),
       dormant: t.dormant.filter((d) => d.group === g.id).map(sleeper),
       groups: T.children(t, g.id).map(node),
     });
@@ -536,10 +549,16 @@ export default class Spaces extends View {
     }
     // Groups: the spaces of no group first, then each group in the order the tree shows them
     // (a group, then the groups under it); a worktree goes with its checkout.
+    // A group's head (and its worktrees) goes first in it.
     const G = tree(), ranks = T.ranks(G), rank = (id) => ranks[id] ?? -1;
-    let last = null;
-    for (const r of out) { r.group = r.tree ? last : (G.of[r.w.id] in ranks ? G.of[r.w.id] : null); last = r.group; }
-    out.sort((a, b) => rank(a.group) - rank(b.group)); // stable: the order inside a group stays
+    const heads = new Set(G.groups.map((g) => T.headSpace(G, g)).filter(Boolean));
+    let last = null, lead = false;
+    for (const r of out) {
+      r.group = r.tree ? last : (G.of[r.w.id] in ranks ? G.of[r.w.id] : null);
+      r.lead = r.tree ? lead : heads.has(r.w.id);
+      last = r.group; lead = r.lead;
+    }
+    out.sort((a, b) => rank(a.group) - rank(b.group) || (b.lead ? 1 : 0) - (a.lead ? 1 : 0)); // stable: the order inside a group stays
     // Simulate the batch so later indexes include earlier moves. An attempted
     // write can lose a sync conflict: allow the echo to settle before retrying.
     const order = sp.map(w => w.id);
@@ -652,13 +671,24 @@ export default class Spaces extends View {
       // what it holds at any depth: its count and the loudest state when folded
       const inside = T.subtree(G, g.id), deep = rows.filter((r) => inside.has(r.group)), isFolded = folded.has(g.id);
       const loud = loudest(deep.flatMap((r) => team(r.w.id)).filter((a) => a.status !== "idle"));
-      out.push(this.folder(g, t, { depth, rails, last, folded: isFolded, loud, count: deep.length }));
+      // its head: a space shown as the group's row (its agents first under it), else its dormant entry
+      const hs = T.headSpace(G, g), head = hs ? rows.find((r) => r.w.id === hs && !r.tree) ?? null : null;
+      const sleeper = !head && g.head?.dormant ? sleeping(g.id).find((d) => d.id === g.head.dormant) ?? null : null;
+      const crew = head ? team(head.w.id) : [], opened = Boolean(head) && open.has(head.w.id) && crew.length > 0;
+      const items = [
+        ...(opened ? crew.map((a) => ["agent", a]) : []),
+        ...spacesIn(g.id).filter((r) => r !== head).map((r) => ["space", r]),
+        ...sleeping(g.id).filter((d) => d.id !== g.head?.dormant).map((d) => ["dormant", d]),
+        ...T.children(G, g.id).map((c) => ["group", c]),
+      ];
+      const opts = { depth, rails, last, folded: isFolded, loud, count: deep.length, items: items.length > 0 };
+      out.push(this.folder(g, t, head ? { ...opts, head, crew, opened } : sleeper ? { ...opts, sleeper } : opts));
       if (isFolded) return;
-      const items = [...spacesIn(g.id).map((r) => ["space", r]), ...sleeping(g.id).map((d) => ["dormant", d]), ...T.children(G, g.id).map((c) => ["group", c])];
       const under = depth ? [...rails, !last] : [];
       items.forEach(([kind, x], n) => {
         const l = n === items.length - 1;
         if (kind === "space") spaceRows(x, depth + 1, under, l);
+        else if (kind === "agent") out.push(this.agentRow(x, t, { depth: depth + 1, rails: under, last: l }));
         else if (kind === "dormant") out.push(this.dormantRow(x, t, { depth: depth + 1, rails: under, last: l }));
         else groupRows(x, depth + 1, under, l);
       });
@@ -680,14 +710,76 @@ export default class Spaces extends View {
       .child(div().absolute().left(x).top(H / 2).w(STEP - 9).h(1).bg(t.input));
   }
 
-  // A group's folder row. Drag a space or a folder onto it to put it inside; a click folds it.
-  folder(g, t, { depth, rails, last, folded, loud, count }) {
-    const H = 28, id = g.id;
+  // A group's row. Drag a space or a group onto it to put it inside. A plain group is a folder: a
+  // click folds it. A group with a head shows that space instead (a click shows the space, the
+  // chevron folds, the agent count opens its agents), or, while the head is a sleeping dormant
+  // entry, that entry (a click opens its space).
+  folder(g, t, { depth, rails, last, folded, loud, count, items = true, head = null, crew = [], opened = false, sleeper = null }) {
+    const H = head || sleeper ? 30 : 28, id = g.id;
     const dragging = this.pressed !== null || this.pressedGroup !== null;
     const drop = dragging && this.overGroup === id && this.pressedGroup !== id;
     const tint = g.color ? (g.color.startsWith("#") ? g.color : MARK[g.color] ?? t[g.color]) : null;
+    const fold = () => change((x) => T.foldGroup(x, { group: id }));
+    const clicked = (cx) => {
+      if (head) run("space.select", { id: head.w.id });
+      else if (sleeper) this.wakeSoon(sleeper.id, cx);
+      else fold();
+    };
+    // a chevron of its own (in a head row: the row itself shows the space)
+    const chevron = div().id(`fold-${id}`).w(10).h(18).flex_none().flex().items_center().justify_center().rounded(3)
+      .when(items, (el) => el.cursor_pointer().hover((s) => s.bg(t.raised))
+        .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+        .on_mouse_up("left", (_e, cx) => { cx.stop_propagation(); this.pressed = null; this.pressedGroup = null; this.overGroup = null; fold(); cx.notify(); })
+        .child(svg(`mods/workspace-chrome/chevron-${folded ? "right" : "down"}.svg`).size(10).text_color(t.dim)));
+    const mark = (name, color) => h_flex().size(18).flex_none().rounded(5).items_center().justify_center().text_size(10.5).font_bold()
+      .when(Boolean(color), (el) => el.bg(color).text_color("#ffffff"))
+      .when(!color, (el) => el.border(1).border_color(t.dim).text_color(t.dim))
+      .child([...name][0]?.toUpperCase() ?? "?");
+    let body;
+    if (head) {
+      const w = head.w, colors = demo() ? DEMO.colors : shared("space.colors") ?? {}, c = colors[w.id] ?? "ansi6";
+      const own = loudest(crew.filter((a) => a.status !== "idle"));
+      body = h_flex().flex_1().min_w(0).gap(9).items_center()
+        .child(chevron)
+        .child(mark(w.name, c.startsWith("#") ? c : MARK[c] ?? t[c]))
+        .child(div().flex_shrink(0).max_w(150).truncate().font_medium().text_color(t.foreground).child(w.name))
+        .child(head.g ? this.gitTail(head.g, null, w.name, t) : div().flex_1())
+        .when(folded ? Boolean(loud) : Boolean(own) && !opened, (el) => el.child(stateIcon(t, folded ? loud : own)))
+        // its agents' count: a click shows or hides them, first under it
+        .when(crew.length > 0, (el) => el.child(div().id(`crew-${id}`).flex_none().px(3).rounded(3).text_size(10.5).text_color(opened ? t.muted : t.dim)
+          .cursor_pointer().hover((s) => s.bg(t.raised).text_color(t.foreground)).tooltip(opened ? "Hide its agents" : "Show its agents")
+          .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+          .on_mouse_up("left", (_e, cx) => {
+            cx.stop_propagation();
+            this.pressed = null; this.pressedGroup = null; this.overGroup = null;
+            change((x) => { const set = new Set(x.open); set.has(w.id) ? set.delete(w.id) : set.add(w.id); x.open = [...set]; });
+            if (folded) fold();
+            cx.notify();
+          })
+          .child(String(crew.length))));
+    } else if (sleeper) {
+      const waking = this.waking?.has(sleeper.id), hot = this.hot === `head-${id}`;
+      body = h_flex().flex_1().min_w(0).gap(9).items_center()
+        .child(chevron)
+        .child(mark(sleeper.name, null))
+        .child(div().flex_1().min_w(0).truncate().font_medium().text_color(t.muted).child(sleeper.name))
+        .when(waking || hot, (el) => el.child(div().flex_none().text_size(10.5).text_color(t.dim).child(waking ? "opening…" : "open")))
+        .when(folded && Boolean(loud), (el) => el.child(stateIcon(t, loud)))
+        .child(div().flex_none().text_size(10.5).text_color(t.dim).child(String(count)));
+    } else {
+      body = h_flex().flex_1().min_w(0).gap(7).items_center()
+        .child(svg(`mods/workspace-chrome/chevron-${folded ? "right" : "down"}.svg`).size(10).flex_none().text_color(t.dim))
+        .child(svg(`mods/spaces-tree/${folded ? "folder" : "folder-open"}.svg`).size(15).flex_none().text_color(tint ?? (folded ? t.muted : t.accent)))
+        .child(div().flex_1().min_w(0).truncate().font_medium().child(g.name))
+        .when(folded && Boolean(loud), (el) => el.child(stateIcon(t, loud)))
+        .child(div().flex_none().text_size(10.5).text_color(t.dim).child(String(count)));
+    }
     return h_flex().id(`group-${id}`).h(H).flex_none().px(8).items_center().rounded(8).cursor_pointer()
-      .text_color(drop ? t.foreground : t.muted).when(drop, (el) => el.bg(t.selected)).hover((s) => s.bg(t.hover).text_color(t.foreground))
+      .text_color(drop ? t.foreground : t.muted)
+      .when(Boolean(head?.w.active) && !drop, (el) => el.bg(t.selected))
+      .when(drop, (el) => el.bg(t.selected)).hover((s) => s.bg(t.hover).text_color(t.foreground))
+      .when(Boolean(sleeper), (el) => el.tooltip(`Dormant: click to open a space in ${sleeper.folder}`)
+        .on_hover((over, cx) => { const key = `head-${id}`, next = over ? key : this.hot === key ? null : this.hot; if (next !== this.hot) { this.hot = next; cx.notify(); } }))
       .when(this.pressedGroup === id && this.overGroup !== id, (el) => el.opacity(0.5))
       .on_mouse_down("left", () => { this.pressedGroup = id; this.pressed = null; this.overGroup = id; })
       .on_mouse_move((_e, cx) => { if ((this.pressed !== null || this.pressedGroup !== null) && this.overGroup !== id) { this.overGroup = id; this.over = null; cx.notify(); } })
@@ -696,19 +788,14 @@ export default class Spaces extends View {
         this.pressed = null; this.pressedGroup = null; this.over = null; this.overGroup = null;
         try {
           if (over === id && space !== null) change((x) => T.putSpace(x, { space, group: id }));
-          else if (over === id && group === id) change((x) => T.foldGroup(x, { group: id }));
+          else if (over === id && group === id) clicked(cx);
           else if (over === id && group !== null) change((x) => T.moveGroup(x, { group, parent: id }));
         } catch {}   // a folder dropped into itself, or beside a twin: nothing moves
         cx.notify();
       })
-      .on_mouse_down("right", () => openOverlay({ mod: "spaces-tree", kind: "popup", width: 220, height: 150, props: { group: id } }))
+      .on_mouse_down("right", () => openOverlay({ mod: "spaces-tree", kind: "popup", width: 220, height: g.head ? 176 : 150, props: { group: id } }))
       .when(depth > 0, (el) => el.child(this.guides(t, depth, rails, last, H)))
-      .child(h_flex().flex_1().min_w(0).gap(7).items_center()
-        .child(svg(`mods/workspace-chrome/chevron-${folded ? "right" : "down"}.svg`).size(10).flex_none().text_color(t.dim))
-        .child(svg(`mods/spaces-tree/${folded ? "folder" : "folder-open"}.svg`).size(15).flex_none().text_color(tint ?? (folded ? t.muted : t.accent)))
-        .child(div().flex_1().min_w(0).truncate().font_medium().child(g.name))
-        .when(folded && Boolean(loud), (el) => el.child(stateIcon(t, loud)))
-        .child(div().flex_none().text_size(10.5).text_color(t.dim).child(String(count))));
+      .child(body);
   }
 
   // A dormant entry: a project with no open space. A click opens one there.
@@ -795,12 +882,17 @@ export default class Spaces extends View {
       return root
         .children(list.map((g) => item(`pick-${g.id}`, g.name, g.id === now, () => change((x) => T.putSpace(x, { space: id, group: g.id })), null, T.depthOf(G, g.id))))
         .child(item("pick-none", "No group", !now, () => change((x) => T.putSpace(x, { space: id, group: null })), t.muted))
+        .when(Boolean(now), (el) => {
+          const heads = T.headSpace(G, T.byId(G, now)) === id, machine = spaces().find((s) => s.id === id)?.machine ?? null;
+          return el.child(item("pick-head", "Show as the group's row", heads, () => change((x) => T.setHead(x, heads ? { group: now } : { group: now, space: id, machine }))));
+        })
         .child(div().h(1).my(3).bg(t.border)).child(field);
     }
     const g = T.byId(G, props()?.group);
     if (!g) return gone();
     return root.child(div().px(10).pt(4).pb(2).text_size(11).text_color(t.dim).child("Rename the group")).child(field)
       .child(div().h(1).my(3).bg(t.border))
+      .when(Boolean(g.head), (el) => el.child(item("group-unhead", "Show as a folder", false, () => change((x) => T.setHead(x, { group: g.id })))))
       .when(Boolean(g.parent), (el) => el.child(item("group-top", "Move to the top level", false, () => change((x) => T.moveGroup(x, { group: g.id, parent: null })))))
       .child(item("group-delete", "Delete the group", false, () => change((x) => T.removeGroup(x, { group: g.id })), t.blocked));
   }
