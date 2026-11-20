@@ -20,12 +20,14 @@ Each call writes one request into <app home>/data/spaces-tree/inbox, nudges the 
   spaces-tree dormant open ENTRY [--focus]
   spaces-tree dormant put ENTRY (--group GROUP | --none)
   spaces-tree dormant rm ENTRY
+  spaces-tree option lock-branches (on | off)    (on: nothing leaves its top-level branch without --force)
   spaces-tree raw '{"op": "...", "args": {...}}'
 
 GROUP: a group id, a path ("Personal/Tools") or a name only one group has.
 SPACE: a space id from `herdr-app ls`, or a name only one space has.
 ENTRY: a dormant entry id, or a name only one entry has.
 ARGV: a JSON list ('["claude"]') or a command line ("claude --continue").
+--force: space put, group move, group head and dormant put move across locked branches.
 Options for every call: --timeout SECONDS (default 20).
 """
 
@@ -95,6 +97,10 @@ def parse(args):
     what = args.pop(0)
     if what == "list":
         return {"op": "list", "args": {}}
+    if what == "option":
+        if len(args) != 2 or args[0] != "lock-branches" or args[1] not in ("on", "off"):
+            die("option lock-branches (on | off)", 1)
+        return {"op": "options.set", "args": {"lockBranches": args[1] == "on"}}
     if what == "raw":
         if len(args) != 1:
             die("raw takes one JSON object", 1)
@@ -109,6 +115,8 @@ def parse(args):
         die(f"{what} what? See spaces-tree --help", 1)
     verb = args.pop(0)
     op, a = f"{what}.{verb}", {}
+    if take(args, "--force", has_value=False):
+        a["force"] = True
     if what == "group":
         if verb == "add":
             a["parent"] = take(args, "--parent")

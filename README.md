@@ -14,6 +14,7 @@ Your [Herdr](https://herdr.dev) spaces as a folder tree, with their agents insid
 - **States as icons.** A green ring that turns: active. A red "!": needs you. An orange dot: finished and not looked at yet. A grey ring: idle. A closed space and a folded group show the loudest state of everything inside, at every level.
 - **Dormant entries.** A project with no open space: a name, a folder and, if you like, the agent to start. It shows with a hollow avatar. A click opens a real space there, in the same place in the tree. When that space closes, the entry goes back to dormant instead of disappearing. Keep every project in the tree without keeping every space open.
 - **Moving things:** drag a space or a folder onto a folder to put it inside; drop it on the "Spaces" title to take it out of every group. Hover a space and press **⋯** to pick a group or type a new one (`Clients/Acme` makes both). A right click on a folder renames it, moves it to the top level or deletes it (what it held goes up one level). A right click on a dormant entry opens or removes it.
+- **Locked branches (optional, off by default).** With `spaces-tree option lock-branches on`, nothing leaves its top-level group (its branch): a drag into another branch is refused with a short hint under the title, the ⋯ popup lists only the space's own branch, and the API asks for `--force`. Moves inside a branch (into and out of its sub-groups, reordering) work as usual; a space in no group may still go anywhere.
 - **Group colors:** a group's folder can have its own color (set it with the agent API).
 - Everything else is Herdr's own spaces list: colored avatars, worktrees under their checkout, drag to reorder, the space menu on right click, machines.
 
@@ -47,11 +48,14 @@ $ST dormant add --space shop-api               # back an open space: it sleeps h
 $ST dormant open billing                       # opens the space, prints its id; --focus shows it
 $ST dormant put billing --group Work/Acme      # or --none
 $ST dormant rm billing                         # forgets the entry; an open space stays open
+
+$ST option lock-branches on                    # or off; then space put, group move, group head and
+                                               # dormant put need --force to cross top-level branches
 ```
 
 A group is named by its id, its path (`Work/Clients`) or a name only one group has. A dormant entry is named by its id or a name only one entry has. `--argv` takes a JSON list or a plain command line. `$ST raw '{"op":"group.add","args":{"name":"Work"}}'` sends any request as it is.
 
-`list` answers with every group (`id`, `name`, `path`, `color`, `folded`, `head` = `{ space, name, open, dormant }` or null, and its `spaces`, `dormant` and `groups`), then `ungrouped` spaces and dormant entries. A space carries its `id`, `name`, `folder`, `machine`, `status` and, when a dormant entry backs it, that entry's id in `dormant`; a group's head is in its `spaces` too, with `head: true`. A dormant entry carries `open` and the `space` it has open now.
+`list` answers with `options` (`lockBranches`), every group (`id`, `name`, `path`, `color`, `folded`, `head` = `{ space, name, open, dormant }` or null, and its `spaces`, `dormant` and `groups`), then `ungrouped` spaces and dormant entries. A space carries its `id`, `name`, `folder`, `machine`, `status` and, when a dormant entry backs it, that entry's id in `dormant`; a group's head is in its `spaces` too, with `head: true`. A dormant entry carries `open` and the `space` it has open now.
 
 **How it works.** Herdr has no way to pass arguments to a mod and get an answer, so the API uses files. The script writes each request to `~/.config/herdr-app/data/spaces-tree/inbox/<id>.json` and nudges the mod (`herdr-app do spaces-tree.inbox`); the mod also watches the folder. The mod applies the change to the tree in Herdr's shared state and writes the answer to `outbox/<id>.json`, which the script prints and deletes. The tree itself is shared state, so it survives an app restart. If no answer comes in time (the mod is not in the shown layout, or the app is closed), the script takes its request back, so it does not happen later. `HERDR_APP_HOME` picks another app home, as for `herdr-app`. The script needs `python3`.
 
@@ -77,7 +81,7 @@ herdr-app check ~/.config/herdr-app/mods/spaces-tree
 
 ## Upgrading
 
-From 2.0: nothing to do; groups get an empty `head`.
+From 2.0 or 2.1: nothing to do; groups get an empty `head` and the branch lock is off.
 
 From 0.2: the groups of version 0.2 (`spaces-tree.groups`) become top-level groups of the new tree on the first start, with the same spaces, folds and open spaces. The new tree is kept in `spaces-tree.tree`; the old key is left as it was.
 

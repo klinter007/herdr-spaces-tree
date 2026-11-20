@@ -10,20 +10,40 @@
 //     of:      { spaceId: groupId }                                           (a space's group)
 //     folded:  [groupId], open: [spaceId]                                     (folded groups, spaces showing agents)
 //     dormant: [{ id, name, folder, argv: string[] | null, machine: string | null,
-//                 group: groupId | null, space: spaceId | null }] }          (space: the open space it backs)
+//                 group: groupId | null, space: spaceId | null }],          (space: the open space it backs)
+//     options: { lockBranches: boolean } }
+//              lockBranches: nothing leaves its top-level branch (a top-level group and all under it)
+//              unless the change says `force`; what is in no group may still go anywhere.
 // v1, in shared "spaces-tree.groups": { order: [name], of: { spaceId: name }, folded: [name], open: [spaceId] }.
 // v1 is read once and never written, so it stays as it was.
 
 export const TREE = "spaces-tree.tree";
 export const V1 = "spaces-tree.groups";
 
-export const empty = () => ({ v: 2, groups: [], of: {}, folded: [], open: [], dormant: [] });
+export const empty = () => ({ v: 2, groups: [], of: {}, folded: [], open: [], dormant: [], options: { lockBranches: false } });
 
 // Friendly color names, stored as the avatar palette's names.
 export const COLOR_NAMES = { teal: "ansi6", orange: "ansi3", blue: "ansi4", purple: "ansi5", green: "ansi2", pink: "ansi1" };
 
 export class TreeError extends Error {}
 const fail = (msg) => { throw new TreeError(msg); };
+
+// The top-level group a group is under (itself at the top); null for no group.
+export function branchOf(t, gid) {
+  let g = gid ? byId(t, gid) : null;
+  while (g?.parent) g = byId(t, g.parent);
+  return g?.id ?? null;
+}
+
+// With lockBranches on, something in branch `from` may not go to branch `to`. `hint`: a short
+// line for the sidebar.
+function guard(t, force, from, to, what) {
+  if (force || !t.options?.lockBranches || from === null || from === to) return;
+  const name = byId(t, from)?.name ?? "its branch";
+  const e = new TreeError(`${what} stays in "${name}": top-level branches are locked (force moves it anyway)`);
+  e.hint = `Branches are locked: it stays in ${name}`;
+  throw e;
+}
 
 // v1 → v2. Deterministic ids (g1, g2, ...): the result is the same on every read until it is saved.
 export function migrate(v1) {
@@ -82,6 +102,7 @@ export function normalize(raw) {
     if (g.head?.dormant && !dseen.has(g.head.dormant)) g.head.dormant = null;
     if (g.head && !g.head.space && !g.head.dormant) g.head = null;
   }
+  t.options = { lockBranches: Boolean(raw.options?.lockBranches) };
   return t;
 }
 
@@ -203,10 +224,11 @@ export function removeGroup(t, { group }) {
 }
 
 // parent null: the top level. before: a sibling to go in front of; else it goes last.
-export function moveGroup(t, { group, parent = null, before = null }) {
+export function moveGroup(t, { group, parent = null, before = null, force = false }) {
   const id = resolve(t, group) ?? fail("which group?");
   const pid = resolve(t, parent);
   if (pid && subtree(t, id).has(pid)) fail("a group cannot go inside itself");
+  guard(t, force, branchOf(t, id), pid ? branchOf(t, pid) : id, `the group "${byId(t, id).name}"`);
   const g = byId(t, id);
   if (checkName(t, g.name, pid, id).twin) fail(`there is already a group "${g.name}" there`);
   t.groups = t.groups.filter((x) => x.id !== id);
@@ -234,9 +256,10 @@ export function foldGroup(t, { group, folded }) {
 
 // group null: out of every group. A dormant entry that backs the space moves with it.
 // A head that leaves its group stops being its head.
-export function putSpace(t, { space, group = null }) {
+export function putSpace(t, { space, group = null, force = false }) {
   if (typeof space !== "string" || !space) fail("which space?");
   const gid = resolve(t, group);
+  guard(t, force, branchOf(t, t.of[space]), branchOf(t, gid), "the space");
   if (gid) t.of[space] = gid; else delete t.of[space];
   for (const d of t.dormant) if (d.space === space) d.group = gid;
   for (const g of t.groups) if (g.id !== gid && headSpace(t, g) === space) g.head = null;
@@ -254,12 +277,13 @@ export function headSpace(t, g) {
 // other. A space that backs a dormant entry heads it as that entry, so when the space closes the
 // row shows the entry. `dormant` alone: a dormant entry heads the group.
 // Neither: the group is a plain folder again; its head stays in it as a space.
-export function setHead(t, { group, space = null, machine = null, dormant = null }) {
+export function setHead(t, { group, space = null, machine = null, dormant = null, force = false }) {
   const id = resolve(t, group) ?? fail("which group?");
   const g = byId(t, id);
   if (!space && !dormant) { g.head = null; return { id, head: null }; }
   const d = dormant ? resolveDormant(t, dormant) : t.dormant.find((x) => x.space === space) ?? null;
   const live = space ?? d?.space ?? null;
+  guard(t, force, branchOf(t, d ? d.group : t.of[live]), branchOf(t, id), "the head");
   for (const x of t.groups) {
     if (x.id === id || !x.head) continue;
     if ((live && headSpace(t, x) === live) || (d && x.head.dormant === d.id)) x.head = null;
@@ -303,9 +327,11 @@ export function addDormant(t, { name, folder, argv = null, machine = null, group
   return { id, group: gid };
 }
 
-export function putDormant(t, { dormant, group = null }) {
+export function putDormant(t, { dormant, group = null, force = false }) {
   const d = resolveDormant(t, dormant);
-  d.group = resolve(t, group);
+  const gid = resolve(t, group);
+  guard(t, force, branchOf(t, d.group), branchOf(t, gid), "the dormant entry");
+  d.group = gid;
   for (const g of t.groups) if (g.head?.dormant === d.id && g.id !== d.group) g.head = null;
   if (d.space) { if (d.group) t.of[d.space] = d.group; else delete t.of[d.space]; }
   return { id: d.id, group: d.group };
