@@ -4,7 +4,7 @@ Your [Herdr](https://herdr.dev) spaces as a folder tree, with their agents insid
 
 ![Spaces Tree](preview.png)
 
-*The picture shows the mod's demo data (`props { demo: true }`), not a real project.*
+*The picture shows the mod's demo data (`props { demo: true }`), not a real project: a Work group headed by the shop-api space (its agents open), with a Design group inside it, Side projects, and Home folded.*
 
 ## What it does
 
